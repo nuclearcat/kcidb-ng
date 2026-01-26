@@ -27,11 +27,12 @@ KCIDB-Rust REST submissions receiver
 */
 
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{Multipart, State};
 use axum::http::StatusCode;
-use axum::http::header::HeaderMap;
+use axum::http::header::{HeaderMap, CONTENT_LENGTH};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
+use axum::body::Bytes;
 use axum_server::tls_rustls::RustlsConfig;
 use clap::Parser;
 use jsonwebtoken::{DecodingKey, Validation, decode};
@@ -289,6 +290,7 @@ async fn main() {
         let app = Router::new()
             .route("/", get(handle_root))
             .route("/submit", post(receive_submission))
+            .route("/submitlogs", post(receive_logs))
             .route("/status", get(submission_status))
             .route("/metrics", get(submission_metrics))
             .route("/health", get(|| async { "OK" }))
@@ -315,6 +317,7 @@ async fn main() {
         let app = Router::new()
             .route("/", get(handle_root))
             .route("/submit", post(receive_submission))
+            .route("/submitlogs", post(receive_logs))
             .route("/status", get(submission_status))
             .route("/metrics", get(submission_metrics))
             .route("/health", get(|| async { "OK" }))
@@ -385,6 +388,82 @@ fn generate_answer(status: &str, id: &str, message: Option<String>) -> String {
     };
     // serialize to json
     serde_json::to_string(&status).unwrap().to_string()
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LogUploadResponse {
+    log_url: String,
+}
+
+fn storage_base_url() -> String {
+    let base = std::env::var("KCIDB_STORAGE_URL")
+        .unwrap_or_else(|_| "https://files.kernelci.org".to_string());
+    base.trim_end_matches('/').to_string()
+}
+
+fn sanitize_filename(filename: &str) -> Result<String, String> {
+    let base = Path::new(filename)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .trim();
+    if base.is_empty() {
+        return Err("Missing filename".to_string());
+    }
+    if base == "." || base == ".." {
+        return Err("Invalid filename".to_string());
+    }
+    if !base.ends_with(".log.gz") {
+        return Err("Filename must end with .log.gz".to_string());
+    }
+    let stem = &base[..base.len().saturating_sub(7)];
+    if stem.is_empty() {
+        return Err("Filename must start with [a-z0-9_]+".to_string());
+    }
+    if !stem
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        return Err("Filename must match [a-z0-9_]+.log.gz".to_string());
+    }
+    Ok(base.to_string())
+}
+
+fn validate_origin(origin: &str) -> Result<(), String> {
+    if origin.is_empty() {
+        return Err("Empty origin".to_string());
+    }
+    if !origin
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return Err("Invalid origin".to_string());
+    }
+    Ok(())
+}
+
+fn normalize_log_filename(filename: &str) -> String {
+    if filename.ends_with(".log.gz") {
+        filename.to_string()
+    } else {
+        format!("{}.log.gz", filename)
+    }
+}
+
+fn validate_submission_id(id: &str) -> Result<(), String> {
+    if id.is_empty() {
+        return Err("Empty submission_id".to_string());
+    }
+    if id.len() > 64 {
+        return Err("submission_id too long".to_string());
+    }
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        return Err("submission_id must match [a-z0-9_]+".to_string());
+    }
+    Ok(())
 }
 
 
@@ -555,6 +634,240 @@ async fn receive_submission(
             (StatusCode::BAD_REQUEST, err_json)
         }
     }
+}
+
+// POST /submitlogs multipart/form-data
+async fn receive_logs(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let auth_result = verify_auth(headers, state.clone());
+    let origin: String;
+    match auth_result {
+        Ok(jwt) => {
+            origin = jwt.origin;
+        }
+        Err(e) => {
+            println!("Error: {}", e);
+            let err_status = SubmissionStatus {
+                id: "0".to_string(),
+                status: "error".to_string(),
+                message: Some(e),
+            };
+            let err_json = serde_json::to_string(&err_status).unwrap();
+            state.error_counter.fetch_add(1, Ordering::Relaxed);
+            return (StatusCode::UNAUTHORIZED, err_json);
+        }
+    }
+
+    if let Err(e) = validate_origin(&origin) {
+        state.user_error_counter.fetch_add(1, Ordering::Relaxed);
+        let err_status = SubmissionStatus {
+            id: "0".to_string(),
+            status: "error".to_string(),
+            message: Some(e),
+        };
+        let err_json = serde_json::to_string(&err_status).unwrap();
+        return (StatusCode::BAD_REQUEST, err_json);
+    }
+
+    let mut submission_id: Option<String> = None;
+    let mut file_bytes: Option<Bytes> = None;
+    let mut file_name: Option<String> = None;
+    let mut file_length_header: Option<u64> = None;
+
+    while let Some(field) = match multipart.next_field().await {
+        Ok(field) => field,
+        Err(e) => {
+            println!("Error: {}", e);
+            state.user_error_counter.fetch_add(1, Ordering::Relaxed);
+            let err_status = SubmissionStatus {
+                id: "0".to_string(),
+                status: "error".to_string(),
+                message: Some("Invalid multipart form data".to_string()),
+            };
+            let err_json = serde_json::to_string(&err_status).unwrap();
+            return (StatusCode::BAD_REQUEST, err_json);
+        }
+    } {
+        if let Some(name) = field.name() {
+            if name == "submission_id" || name == "submissionid" {
+                if let Ok(text) = field.text().await {
+                    submission_id = Some(text.trim().to_string());
+                }
+                continue;
+            }
+        }
+
+        if field.name() == Some("log") && field.file_name().is_some() {
+            if file_bytes.is_none() {
+                file_name = field.file_name().map(|s| s.to_string());
+                if let Some(header_value) = field.headers().get(CONTENT_LENGTH) {
+                    if let Ok(header_str) = header_value.to_str() {
+                        if let Ok(value) = header_str.parse::<u64>() {
+                            file_length_header = Some(value);
+                        }
+                    }
+                }
+                match field.bytes().await {
+                    Ok(bytes) => file_bytes = Some(bytes),
+                    Err(_) => {
+                        state.user_error_counter.fetch_add(1, Ordering::Relaxed);
+                        let err_status = SubmissionStatus {
+                            id: "0".to_string(),
+                            status: "error".to_string(),
+                            message: Some("Failed to read uploaded file".to_string()),
+                        };
+                        let err_json = serde_json::to_string(&err_status).unwrap();
+                        return (StatusCode::BAD_REQUEST, err_json);
+                    }
+                }
+            }
+        }
+    }
+
+    let submission_id = match submission_id {
+        Some(id) => id,
+        None => {
+            state.user_error_counter.fetch_add(1, Ordering::Relaxed);
+            let err_status = SubmissionStatus {
+                id: "0".to_string(),
+                status: "error".to_string(),
+                message: Some("submission_id is required".to_string()),
+            };
+            let err_json = serde_json::to_string(&err_status).unwrap();
+            return (StatusCode::BAD_REQUEST, err_json);
+        }
+    };
+
+    if let Err(e) = validate_submission_id(&submission_id) {
+        state.user_error_counter.fetch_add(1, Ordering::Relaxed);
+        let err_status = SubmissionStatus {
+            id: "0".to_string(),
+            status: "error".to_string(),
+            message: Some(e),
+        };
+        let err_json = serde_json::to_string(&err_status).unwrap();
+        return (StatusCode::BAD_REQUEST, err_json);
+    }
+
+    let file_name = match file_name {
+        Some(name) => name,
+        None => {
+            state.user_error_counter.fetch_add(1, Ordering::Relaxed);
+            let err_status = SubmissionStatus {
+                id: "0".to_string(),
+                status: "error".to_string(),
+                message: Some("log file is required".to_string()),
+            };
+            let err_json = serde_json::to_string(&err_status).unwrap();
+            return (StatusCode::BAD_REQUEST, err_json);
+        }
+    };
+
+    let sanitized = match sanitize_filename(&file_name) {
+        Ok(name) => name,
+        Err(e) => {
+            state.user_error_counter.fetch_add(1, Ordering::Relaxed);
+            let err_status = SubmissionStatus {
+                id: "0".to_string(),
+                status: "error".to_string(),
+                message: Some(e),
+            };
+            let err_json = serde_json::to_string(&err_status).unwrap();
+            return (StatusCode::BAD_REQUEST, err_json);
+        }
+    };
+    let normalized_name = normalize_log_filename(&sanitized);
+
+    let file_bytes = match file_bytes {
+        Some(bytes) => bytes,
+        None => {
+            state.user_error_counter.fetch_add(1, Ordering::Relaxed);
+            let err_status = SubmissionStatus {
+                id: "0".to_string(),
+                status: "error".to_string(),
+                message: Some("log file is required".to_string()),
+            };
+            let err_json = serde_json::to_string(&err_status).unwrap();
+            return (StatusCode::BAD_REQUEST, err_json);
+        }
+    };
+    if let Some(expected) = file_length_header {
+        if file_bytes.len() as u64 != expected {
+            state.user_error_counter.fetch_add(1, Ordering::Relaxed);
+            let err_status = SubmissionStatus {
+                id: "0".to_string(),
+                status: "error".to_string(),
+                message: Some("Log Content-Length mismatch".to_string()),
+            };
+            let err_json = serde_json::to_string(&err_status).unwrap();
+            return (StatusCode::BAD_REQUEST, err_json);
+        }
+    }
+
+    let logs_dir = format!("{}/logs", state.directory);
+    if let Err(e) = std::fs::create_dir_all(&logs_dir) {
+        eprintln!("Failed to create logs directory: {}", e);
+        state.system_error_counter.fetch_add(1, Ordering::Relaxed);
+        let err_status = SubmissionStatus {
+            id: "0".to_string(),
+            status: "error".to_string(),
+            message: Some("Internal server error".to_string()),
+        };
+        let err_json = serde_json::to_string(&err_status).unwrap_or_default();
+        return (StatusCode::INTERNAL_SERVER_ERROR, err_json);
+    }
+
+    let local_filename = format!("{}_{}_{}", origin, submission_id, normalized_name);
+    let temp_path = format!("{}/{}.temp", logs_dir, local_filename);
+    let final_path = format!("{}/{}", logs_dir, local_filename);
+
+    if Path::new(&final_path).exists() || Path::new(&temp_path).exists() {
+        state.user_error_counter.fetch_add(1, Ordering::Relaxed);
+        let err_status = SubmissionStatus {
+            id: "0".to_string(),
+            status: "error".to_string(),
+            message: Some("log file already exists".to_string()),
+        };
+        let err_json = serde_json::to_string(&err_status).unwrap();
+        return (StatusCode::CONFLICT, err_json);
+    }
+
+    if let Err(e) = std::fs::write(&temp_path, &file_bytes) {
+        eprintln!("Failed to write log file: {}", e);
+        state.system_error_counter.fetch_add(1, Ordering::Relaxed);
+        let err_status = SubmissionStatus {
+            id: "0".to_string(),
+            status: "error".to_string(),
+            message: Some("Internal server error".to_string()),
+        };
+        let err_json = serde_json::to_string(&err_status).unwrap_or_default();
+        return (StatusCode::INTERNAL_SERVER_ERROR, err_json);
+    }
+    if let Err(e) = std::fs::rename(&temp_path, &final_path) {
+        eprintln!("Failed to rename log file: {}", e);
+        state.system_error_counter.fetch_add(1, Ordering::Relaxed);
+        let err_status = SubmissionStatus {
+            id: "0".to_string(),
+            status: "error".to_string(),
+            message: Some("Internal server error".to_string()),
+        };
+        let err_json = serde_json::to_string(&err_status).unwrap_or_default();
+        return (StatusCode::INTERNAL_SERVER_ERROR, err_json);
+    }
+
+    let log_url = format!(
+        "{}/{}/{}/{}",
+        storage_base_url(),
+        origin,
+        submission_id,
+        normalized_name
+    );
+    let response = LogUploadResponse { log_url };
+    let jsonstr = serde_json::to_string(&response).unwrap();
+    (StatusCode::OK, jsonstr)
 }
 
 #[derive(Debug, Serialize, Deserialize)]

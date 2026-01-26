@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-axum = { version = "0.8.3", features = ["tokio"] }
+axum = { version = "0.8.3", features = ["tokio", "multipart"] }
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
 clap = { version = "4.5.35", features = ["derive"] }
 jsonwebtoken = "9.3.1"
