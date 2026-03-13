@@ -18,7 +18,7 @@ services:
 # To disable JWT auth
 #    command: ["/usr/local/bin/kcidb-restd-rs","-j",""]
   ingester:
-    image: ghcr.io/kernelci/kcidb-ng/django-ingester:latest
+    image: ${IMAGE_REGISTRY:-ghcr.io}/${IMAGE_OWNER:-kernelci}/${IMAGE_REPOSITORY:-dashboard}/dashboard-backend:${IMAGE_TAG:-latest}
     env_file:
       - .env
     volumes:
@@ -33,6 +33,26 @@ services:
         condition: service_healthy
       dbinit:
         condition: service_completed_successfully
+  pending_aggregations_processor:
+    image: ${IMAGE_REGISTRY:-ghcr.io}/${IMAGE_OWNER:-kernelci}/${IMAGE_REPOSITORY:-dashboard}/dashboard-backend:${IMAGE_TAG:-latest}
+    command:
+        - poetry
+        - run
+        - python3
+        - manage.py
+        - process_pending_aggregations
+        - --loop
+        - --interval
+        - "5"
+    env_file: .env
+    environment:
+        SKIP_CRONJOBS: "True"
+    restart: always
+    networks:
+        - private
+        - public
+    depends_on:
+        - redis
   logspec-worker:
     build:
       context: .
